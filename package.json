@@ -1,0 +1,15 @@
+{
+  "name": "core-platform-arb-advisor",
+  "version": "1.0.0",
+  "scripts": {
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "dev": "concurrently \"npm run dev --prefix server\" \"npm start --prefix client\"",
+    "start:server": "PORT=3002 NODE_EXTRA_CA_CERTS=/Users/lov.sharma/.aisuite/conf/npm-sfdc-certs.pem npm start --prefix server",
+    "server": "PORT=3002 NODE_EXTRA_CA_CERTS=/Users/lov.sharma/.aisuite/conf/npm-sfdc-certs.pem node server/index.js",
+    "start:client": "npm start --prefix client",
+    "build": "npm run build --prefix client"
+  },
+  "devDependencies": {
+    "concurrently": "^8.0.0"
+  }
+}
