@@ -41,7 +41,7 @@ MANDATORY — when the input contains === EXPERIENCE CLOUD / DIGITAL EXPERIENCE 
 - OWD impact — any ReadWrite OWD objects accessible by guest users
 - Number of Live sites and whether the proliferation is controlled
 
-You evaluate designs across these 8 domains:
+You evaluate designs across these 9 domains:
 1. Platform Fit — Declarative vs. code balance, standard vs. custom, legacy automation (Workflow Rules, Process Builder) still in use, LWC vs Aura, API version currency
 2. Governor Limits & Performance — SOQL/DML in loops, bulkification, CPU/heap, async patterns (Queueable, Batch, @future), scheduled job frequency, LDV risk
 3. Data Model & Storage — Object design, OWD sharing model, custom fields on standard objects, relationships, indexing, data skew, archival strategy
@@ -50,6 +50,15 @@ You evaluate designs across these 8 domains:
 6. Experience Cloud & Digital Sites — For EVERY site in the input: Guest User data access risk, site status hygiene (deprecated/legacy sites still Live), CSP alignment, OWD exposure through guest context, site proliferation governance
 7. Integration & APIs — Named Credentials usage, Remote Site Settings, connected apps, external endpoints, idempotency, error handling, rate limits, API version on classes
 8. Maintainability & Supportability — Legacy automation debt (Workflow Rules), API version spread across classes/LWC, scheduled job proliferation, naming conventions, CI/CD signals, tech debt indicators
+9. Batch & Async Processing — For EVERY scheduled job listed: evaluate cron frequency (flag anything faster than hourly), detect jobs firing simultaneously (same cron expression = slot contention), flag any job with "Test" in the name, flag missing concurrency guards (multiple instances of same class Queued/Holding simultaneously), flag missing finish() error alerting, assess risk of hitting the 5-concurrent-batch-slot limit, evaluate daily async Apex execution budget risk, recommend trigger/Platform Event replacement for high-frequency polling batches
+
+MANDATORY — when the input contains === SCHEDULED JOBS === or === ACTIVE/QUEUED APEX JOBS ===, you MUST:
+- List every scheduled job and rate its frequency risk (GREEN/AMBER/RED)
+- Flag any job names containing "Test", "Debug", "Sample", or "Temp" as Critical (should not exist in prod)
+- Flag any cron expressions firing more than once per hour as Critical
+- Flag any class appearing more than once in the Active/Queued jobs list as Critical (overlap/pile-up)
+- Flag jobs sharing the exact same cron expression as Advisory (slot contention)
+- Recommend staggering co-scheduled jobs by at least 15 minutes
 
 For each domain, assign a rating:
 - GREEN — No significant issues
@@ -118,7 +127,7 @@ function callClaude(design, onData, onEnd, onError) {
     messages: [
       {
         role: 'user',
-        content: `Review the following Salesforce Core Platform design or extracted org metadata. Analyse EVERY section — triggers, classes, flows, workflow rules, data model, OWD settings, LWC components, Experience Cloud sites, named credentials, remote site settings, permission sets, profiles, connected apps, scheduled jobs, and validation rules. You MUST produce at least one finding per Experience Cloud site listed. Every finding must name the specific component from the input. Return ONLY valid JSON (no markdown fences, no preamble):\n\n${design}`
+        content: `Review the following Salesforce Core Platform design or extracted org metadata. Analyse EVERY section — triggers, classes, flows, workflow rules, data model, OWD settings, LWC components, Experience Cloud sites, named credentials, remote site settings, permission sets, profiles, connected apps, scheduled jobs, active/queued batch jobs, and validation rules. You MUST produce at least one finding per Experience Cloud site listed AND at least one finding per scheduled job or batch job listed. For scheduled jobs: flag frequency risk, simultaneous-fire conflicts, test/debug names, overlap/pile-up, and missing concurrency guards. Every finding must name the specific component from the input. Return ONLY valid JSON (no markdown fences, no preamble):\n\n${design}`
       }
     ]
   });
@@ -269,7 +278,8 @@ app.post('/api/extract-org', async (req, res) => {
       triggers, allTriggers, classes, flows, workflowRules,
       objects, customFields, namedCreds, remoteSites,
       permSets, profiles, connApps, lwc,
-      validationRules, cronJobs, sites
+      validationRules, cronJobs, sites,
+      activeApexJobs, apexJobSummary
     ] = await Promise.all([
       // Custom-org triggers with body
       sfQuery(alias, "SELECT Name, TableEnumOrId, Body, LengthWithoutComments FROM ApexTrigger WHERE Status='Active' AND NamespacePrefix=null ORDER BY Name LIMIT 15"),
@@ -287,8 +297,10 @@ app.post('/api/extract-org', async (req, res) => {
       sfQuery(alias, "SELECT Name FROM ConnectedApplication ORDER BY Name LIMIT 10"),
       sfQuery(alias, "SELECT MasterLabel, ApiVersion, Description FROM LightningComponentBundle WHERE NamespacePrefix=null ORDER BY MasterLabel LIMIT 20", true),
       sfQuery(alias, "SELECT EntityDefinition.QualifiedApiName, ValidationName, Active FROM ValidationRule WHERE NamespacePrefix=null AND Active=true LIMIT 30", true),
-      sfQuery(alias, "SELECT CronJobDetail.Name, CronJobDetail.JobType, State, NextFireTime FROM CronTrigger WHERE State='WAITING' ORDER BY NextFireTime LIMIT 15"),
+      sfQuery(alias, "SELECT CronJobDetail.Name, CronJobDetail.JobType, CronExpression, State, NextFireTime, PreviousFireTime FROM CronTrigger WHERE State IN ('WAITING','ACQUIRED','EXECUTING') ORDER BY NextFireTime LIMIT 30"),
       sfQuery(alias, "SELECT Name, Status, UrlPathPrefix FROM Network LIMIT 15"),
+      sfQuery(alias, "SELECT Id, JobType, Status, ApexClass.Name, NumberOfErrors, JobItemsProcessed, TotalJobItems, CreatedDate FROM AsyncApexJob WHERE Status IN ('Processing','Queued','Holding') ORDER BY CreatedDate DESC LIMIT 20"),
+      sfQuery(alias, "SELECT ApexClass.Name, Status, COUNT(Id) cnt FROM AsyncApexJob WHERE CreatedDate = TODAY GROUP BY ApexClass.Name, Status ORDER BY COUNT(Id) DESC LIMIT 20"),
     ]);
 
     const sections = [];
@@ -409,7 +421,52 @@ app.post('/api/extract-org', async (req, res) => {
     // ── Scheduled Jobs ────────────────────────────────────────────────────────
     if (cronJobs.length) {
       sections.push('\n=== SCHEDULED JOBS (Apex Schedulable) ===');
-      for (const j of cronJobs) sections.push(`- ${j.CronJobDetail?.Name} | Next: ${j.NextFireTime}`);
+      // Detect simultaneous-fire conflicts (same cron expression)
+      const cronCount = {};
+      for (const j of cronJobs) { const c = j.CronExpression || ''; cronCount[c] = (cronCount[c] || 0) + 1; }
+      for (const j of cronJobs) {
+        const name = j.CronJobDetail?.Name || '?';
+        const cron = j.CronExpression || '?';
+        const next = j.NextFireTime || '?';
+        const prev = j.PreviousFireTime || 'never';
+        const jtype = j.CronJobDetail?.JobType || '?';
+        // Frequency risk analysis
+        const isSubHourly = /^\d+ \d+\/\d+ /.test(cron) || /^\d+ \d+ \*/.test(cron) || /^\*/.test(cron);
+        const isTestName = /test|debug|sample|temp/i.test(name);
+        const hasConflict = cronCount[cron] > 1;
+        const flags = [];
+        if (isTestName) flags.push('⚠ TEST/DEBUG NAME');
+        if (isSubHourly) flags.push('⚠ SUB-HOURLY FREQUENCY');
+        if (hasConflict) flags.push('⚠ SIMULTANEOUS FIRE CONFLICT');
+        sections.push(`- ${name} | Cron: ${cron} | Next: ${next} | Prev: ${prev} | JobType: ${jtype}${flags.length ? ' | FLAGS: ' + flags.join(', ') : ''}`);
+      }
+    }
+
+    // ── Active / Queued Apex Jobs ─────────────────────────────────────────────
+    if (activeApexJobs.length) {
+      sections.push('\n=== ACTIVE / QUEUED APEX JOBS (at time of extract) ===');
+      // Detect duplicate class names = overlap/pile-up
+      const classCount = {};
+      for (const j of activeApexJobs) {
+        const cls = j.ApexClass?.Name || 'Unknown';
+        classCount[cls] = (classCount[cls] || 0) + 1;
+      }
+      for (const j of activeApexJobs) {
+        const cls = j.ApexClass?.Name || 'Unknown';
+        const overlap = classCount[cls] > 1 ? ' | ⚠ OVERLAP — multiple instances running' : '';
+        sections.push(`- [${j.Status}] ${j.JobType} | Class: ${cls} | Errors: ${j.NumberOfErrors} | Items: ${j.JobItemsProcessed}/${j.TotalJobItems}${overlap}`);
+      }
+    } else {
+      sections.push('\n=== ACTIVE / QUEUED APEX JOBS (at time of extract) ===\n- None currently running');
+    }
+
+    // ── Today's Batch Job Summary ─────────────────────────────────────────────
+    if (apexJobSummary.length) {
+      sections.push('\n=== TODAY\'S APEX JOB EXECUTION SUMMARY ===');
+      for (const j of apexJobSummary) {
+        const cls = j.ApexClass?.Name || 'Unknown';
+        sections.push(`- ${cls} | Status: ${j.Status} | Runs today: ${j.cnt}`);
+      }
     }
 
     if (sections.length === 0) {
